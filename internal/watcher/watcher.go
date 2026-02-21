@@ -10,6 +10,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"main/internal/events"
+	"main/internal/filter"
 )
 
 type Watcher struct {
@@ -63,6 +64,9 @@ func (w *Watcher) Start() {
 					w.addIfDir(ev.Name)
 				}
 				if e, ok := normalize(ev); ok {
+					if filter.ShouldIgnore(e.Path) {
+						continue
+					}
 					w.Out <- e
 				}
 			case err := <-w.fsWatcher.Errors:
@@ -76,6 +80,8 @@ func normalize(ev fsnotify.Event) (events.FileEvent, bool) {
 	now := time.Now()
 
 	switch {
+	case ev.Op&fsnotify.Chmod != 0:
+		return events.FileEvent{}, false
 	case ev.Op&fsnotify.Create != 0:
 		return events.FileEvent{Path: ev.Name, Type: events.Created, Timestamp: now}, true
 	case ev.Op&fsnotify.Write != 0:
