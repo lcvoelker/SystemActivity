@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
+	"main/internal/session"
 	"main/internal/watcher"
 )
 
@@ -29,7 +31,7 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println("Working directory: ", wd)
-
+	fmt.Println("Watching: ", root)
 	fmt.Println("Args: ", os.Args)
 	w, err := watcher.New()
 	if err != nil {
@@ -40,10 +42,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	w.Start()
+	manager := session.NewManager(5 * time.Minute)
+	events := make(chan session.Event, 100) //buffered channel
+	// start watcher and pass it the channel
+	go w.Start(events)
+	//go watcher.Start(events)
 
-	fmt.Println("Watching: ", root)
-	for ev := range w.Out {
-		fmt.Printf("[%v] %s\n", ev.Type, ev.Path)
+	// consume events
+	for e := range events {
+		fmt.Printf("EVENT: %s %s\n", e.Op, e.Path)
+		manager.AddEvent(e)
 	}
+
 }
