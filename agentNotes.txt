@@ -1,0 +1,40 @@
+Agent notes — running log for coding agents. The owner's notes are in notes.txt (do not edit it).
+Lasting rules and agreed settings are in AGENTS.md.
+
+== 2026-11-03: Postgres connection and schema ==
+- Chosen by owner: pgx pool + sqlc (typed queries) + goose (embedded migrations); content-addressed schema.
+- Two roles: fm_owner runs migrations, fm_app runs the daemon. db/bootstrap.sql does the superuser setup.
+- 00001_init.sql applied on the owner's real DB at 2026-11-03 16:56 (verified with `migrate status`).
+- Fixed: session IDs used to restart at 1 per run and overwrite earlier sessions (now DB identity).
+
+== 2026-11-03: scaling, retention, classification ==
+Owner's requests and answers:
+- Save every 5 minutes (testing). Merge per file per window instead of one row per event.
+- Buffer: 1,000 file entries, save early when full; retry failed saves at the next 5-min save.
+- Watch buffer 16 KB per folder (fsnotify default is 64 KB; ~16 MB per 1,000 folders now).
+- Only files changed during the run reach Postgres: event-driven + drop WRITEs whose modified
+  time predates the watcher start (sync clients/antivirus) and WRITEs on folders.
+- Moved-in/unzipped folders: record the folder only, not its contents.
+- Delete Postgres data after 3 days.
+- Classify sessions: work / organization / other, stored in sessions.kind.
+Implemented in 00002_activity_retention.sql (NOT yet applied on the real DB as of writing):
+- file_activity replaces file_events (existing rows carried over 1:1); daily UTC partitions.
+- prune_before(cutoff) SECURITY DEFINER; the watcher runs it at startup + hourly; `filemaster prune` runs it manually.
+- Orphan recovery: at watch startup, sessions left open on the same host+root are closed at their
+  last saved activity and classified from saved counts. Activity still buffered in the killed
+  process (up to 5 min) is lost.
+- Classify (internal/session/classify.go): <3 events -> other; writes >= 60% -> work;
+  creates+renames+removes >= 60% -> organization; else other.
+Verified on a throwaway Postgres 18: migration up/down/up with 00001-era rows, 5 integration
+tests, live watch run (stale touch ignored, untouched files absent, moved folder = 1 event,
+10 events -> 3 rows), kill + restart closes the orphan.
+
+== Observations / possible follow-ups (ask before doing any that change volume) ==
+- Windows often reports 2 WRITE events per save (truncate + write), so write counts run ~2x
+  the number of saves. Could debounce WRITEs per file within ~100 ms.
+- Atomic-save editors (JetBrains "safe write", MS Office, Vim with some settings) save via
+  temp file + rename, which reads as CREATE/RENAME/REMOVE and pushes sessions toward
+  "organization". Office lock files (~$name.docx) and `name~` backups aren't filtered yet.
+- Heartbeat option for kill recovery: update sessions.last_seen_at at each 5-min save so an
+  orphan's end time is accurate even with no recent activity.
+- Pre-existing gofmt issues in internal/filter/ignore.go (not touched).

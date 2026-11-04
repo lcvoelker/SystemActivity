@@ -1,0 +1,19 @@
+I added Go Postgresql driver called pgx using command (go get github.com/jackc/pgx/v5)
+
+The CLI now listens for end on stdin and stops the watcher cleanly.
+EndCurrentSession() prints a session summary and closes the active session.
+Event data now carries enough metadata for storage: path, operation, timestamp, old path, hash, and file size.
+Snapshot records are structured for a PostgreSQL pgx store with session, event, and file-snapshot tables.
+The storage layer is set to the local Postgres DSN:
+postgres://postgres:postgres@localhost:5432/systemactivity
+Intended flow
+Run the app against a directory:
+go run main.go -- D:\Downloads\look
+Watch file activity.
+Type end
+The app prints the final session summary and saves the snapshot/session data if Postgres is reachable locally.
+
+RUN COMMAND to watch Downloads\look file:
+
+go run .\cmd\main.go -- D:\Downloads\look
+
