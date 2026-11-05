@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -11,18 +12,20 @@ import (
 // buffer.
 type Store interface {
 	StartSession(ctx context.Context, start time.Time) (int64, error)
-	EndSession(ctx context.Context, id int64, end time.Time, kind Kind) error
+	EndSession(ctx context.Context, id int64, end time.Time, kind Kind, reason EndReason) error
 	Record(e Event)
 }
 
 type Manager struct {
+	root       string // watched folder; summaries show paths relative to it
 	inactivity time.Duration
 	store      Store
 	current    *Session
 }
 
-func NewManager(inactivity time.Duration, store Store) *Manager {
+func NewManager(root string, inactivity time.Duration, store Store) *Manager {
 	return &Manager{
+		root:       root,
 		inactivity: inactivity,
 		store:      store,
 	}
@@ -30,7 +33,7 @@ func NewManager(inactivity time.Duration, store Store) *Manager {
 
 func (m *Manager) AddEvent(ctx context.Context, e Event) error {
 	if m.current != nil && e.Timestamp.Sub(m.current.End) > m.inactivity {
-		if err := m.closeCurrentSession(ctx); err != nil {
+		if err := m.closeCurrentSession(ctx, EndIdle); err != nil {
 			return err
 		}
 	}
@@ -43,6 +46,8 @@ func (m *Manager) AddEvent(ctx context.Context, e Event) error {
 	e.SessionID = m.current.ID
 	m.current.End = e.Timestamp
 	m.current.Counts.Add(e.Op)
+	m.current.Files.Add(m.root, e.Op, e.Path, e.OldPath)
+	m.current.behavior.add(e.Op, e.Path, e.OldPath)
 	m.store.Record(e)
 	return nil
 }
@@ -58,16 +63,16 @@ func (m *Manager) startNewSession(ctx context.Context, start time.Time) error {
 
 // closeCurrentSession always clears the current session, even if the store
 // fails, so the next event starts a fresh one.
-func (m *Manager) closeCurrentSession(ctx context.Context) error {
+func (m *Manager) closeCurrentSession(ctx context.Context, reason EndReason) error {
 	if m.current == nil {
 		return nil
 	}
 	s := m.current
 	m.current = nil
 
-	kind := Classify(s.Counts)
-	fmt.Printf("Session %d closed: %d events (%s)\n", s.ID, s.Counts.Total(), kind)
-	if err := m.store.EndSession(ctx, s.ID, s.End, kind); err != nil {
+	kind := Classify(s.Behavior())
+	fmt.Printf("Session %d closed (%s): %d events, %s\n", s.ID, reason, s.Counts.Total(), kind.Label())
+	if err := m.store.EndSession(ctx, s.ID, s.End, kind, reason); err != nil {
 		return fmt.Errorf("end session %d: %w", s.ID, err)
 	}
 	return nil
@@ -88,18 +93,13 @@ func (m *Manager) EndCurrentSession(ctx context.Context) (Summary, error) {
 		Start:     s.Start,
 		End:       s.End,
 		Counts:    s.Counts,
-		Kind:      Classify(s.Counts),
+		Files:     s.Files,
+		Kind:      Classify(s.Behavior()),
+		EndReason: EndStopped,
 	}
+	summary.Print(os.Stdout)
 
-	fmt.Printf("\n=== Session %d summary ===\n", summary.SessionID)
-	fmt.Printf("kind: %s\n", summary.Kind)
-	fmt.Printf("start: %s\nend: %s\n", summary.Start.Format(time.RFC3339), summary.End.Format(time.RFC3339))
-	fmt.Printf("total events: %d\n", summary.Counts.Total())
-	fmt.Printf("CREATE: %d\nWRITE: %d\nRENAME: %d\nREMOVE: %d\n",
-		s.Counts.Creates, s.Counts.Writes, s.Counts.Renames, s.Counts.Removes)
-	fmt.Println("===========================")
-
-	return summary, m.closeCurrentSession(ctx)
+	return summary, m.closeCurrentSession(ctx, EndStopped)
 }
 
 // OfflineStore numbers sessions locally and discards events. Used when the
@@ -113,6 +113,8 @@ func (s *OfflineStore) StartSession(context.Context, time.Time) (int64, error) {
 	return s.nextID, nil
 }
 
-func (s *OfflineStore) EndSession(context.Context, int64, time.Time, Kind) error { return nil }
+func (s *OfflineStore) EndSession(context.Context, int64, time.Time, Kind, EndReason) error {
+	return nil
+}
 
 func (s *OfflineStore) Record(Event) {}

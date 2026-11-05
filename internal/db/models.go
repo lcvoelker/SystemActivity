@@ -54,12 +54,57 @@ func (ns NullFileOp) Value() (driver.Value, error) {
 	return string(ns.FileOp), nil
 }
 
+type SessionEnd string
+
+const (
+	SessionEndStopped   SessionEnd = "stopped"
+	SessionEndIdle      SessionEnd = "idle"
+	SessionEndRecovered SessionEnd = "recovered"
+)
+
+func (e *SessionEnd) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = SessionEnd(s)
+	case string:
+		*e = SessionEnd(s)
+	default:
+		return fmt.Errorf("unsupported scan type for SessionEnd: %T", src)
+	}
+	return nil
+}
+
+type NullSessionEnd struct {
+	SessionEnd SessionEnd
+	Valid      bool // Valid is true if SessionEnd is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullSessionEnd) Scan(value interface{}) error {
+	if value == nil {
+		ns.SessionEnd, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.SessionEnd.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullSessionEnd) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.SessionEnd), nil
+}
+
 type SessionKind string
 
 const (
 	SessionKindWork         SessionKind = "work"
 	SessionKindOrganization SessionKind = "organization"
 	SessionKindOther        SessionKind = "other"
+	SessionKindMixed        SessionKind = "mixed"
+	SessionKindBrief        SessionKind = "brief"
 )
 
 func (e *SessionKind) Scan(src interface{}) error {
@@ -139,6 +184,7 @@ type Session struct {
 	StartedAt time.Time
 	EndedAt   *time.Time
 	Kind      NullSessionKind
+	EndReason NullSessionEnd
 }
 
 type SessionSummary struct {
@@ -155,4 +201,5 @@ type SessionSummary struct {
 	Writes         int64
 	Renames        int64
 	Removes        int64
+	EndReason      NullSessionEnd
 }

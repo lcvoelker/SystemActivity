@@ -89,15 +89,47 @@ batcher save → per entry, version changes:
 
 `session.Classify` (internal/session/classify.go):
 
-| Kind | Rule |
+Writes are work; creates, renames (including moves) and removes are
+organization, with one exception: a file created during the session and
+then saved is a new document being worked on, so its create and any
+renames of it (draft → final) count as work. The live tracker
+(`behaviorTracker`) follows the new file across renames; sessions
+classified from saved data (recovered ones) apply the rule per path
+(`BehaviorFromFiles`). A behavior is in the label if it's at least 20% of
+the session's events, so a stray rename in a long editing session doesn't
+count.
+
+| Kind (stored) | Shown as | Rule |
+|---|---|---|
+| brief | brief | fewer than 3 events |
+| work | work | only work reaches 20% |
+| organization | organization | only organization reaches 20% |
+| mixed | work + organization | both reach 20% |
+| other | other | from before 00004; no longer produced |
+
+The end-of-session summary and `filemaster session <id>` list the files per
+operation, relative to the watched folder (renames as `old -> new`), at most
+10 per line plus "+N more".
+
+Each closed session also records `end_reason`:
+
+| End reason | Meaning |
 |---|---|
-| other | fewer than 3 events, or nothing dominates |
-| work | WRITEs ≥ 60% of events |
-| organization | CREATE + RENAME + REMOVE ≥ 60% of events |
+| stopped | the user typed `end` or pressed Ctrl+C |
+| idle | the inactivity timeout closed it |
+| recovered | a later watcher closed it after a kill or failed exit; end time is the last saved activity. When its spilled activity is saved later, the same transaction reclassifies it from the full counts. |
 
 ## Lifecycle and retention
 
 - `end` / Ctrl+C: the session is classified and closed, then buffered activity is saved.
+- Startup (`storage.Connect`): open the `fm_app` pool and compare the schema
+  version with the newest embedded migration. If it's behind and
+  `MIGRATE_DATABASE_URL` is set, apply the pending migrations as `fm_owner`
+  (goose advisory lock, up only), close that connection, and reopen as
+  `fm_app`. Otherwise refuse to start with a clear message.
+- Failed final save (e.g. database down at `end`): unsaved entries are
+  written to `%LOCALAPPDATA%\filemaster\unsaved\` and loaded into the buffer
+  by the next `watch`, which saves them with its next regular save.
 - Killed watcher: its session stays open. The next `watch` on the same host
   and root closes it at its last saved activity, classified from saved counts.
   Up to 5 minutes of unsaved activity from the killed process is lost.
@@ -109,7 +141,7 @@ batcher save → per entry, version changes:
 
 | Role | Used by | Rights |
 |---|---|---|
-| `fm_owner` | `filemaster migrate` | Owns schema `filemaster`, runs DDL |
+| `fm_owner` | `filemaster migrate`, and briefly at startup when migrations are pending | Owns schema `filemaster`, runs DDL |
 | `fm_app` | `watch`, `sessions`, `history`, `prune` | DML only, via default privileges; EXECUTE on `ensure_file_activity_partition` and `prune_before` |
 
 See `db/bootstrap.sql` for the one-time superuser setup.

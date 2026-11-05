@@ -38,3 +38,99 @@ tests, live watch run (stale touch ignored, untouched files absent, moved folder
 - Heartbeat option for kill recovery: update sessions.last_seen_at at each 5-min save so an
   orphan's end time is accurate even with no recent activity.
 - Pre-existing gofmt issues in internal/filter/ignore.go (not touched).
+
+== 2026-11-04: schema check, keeping unsaved data ==
+Owner's test run failed because 00002 was pending: the code needs 00002's objects, and the
+final save failed, losing 7 entries. The NewPool "has migrate up been run?" hint never fired:
+pgx LoadTypes filters by name (= ANY) and silently skips types that don't exist.
+- Added checkSchemaVersion (internal/storage/schema.go): NewPool compares
+  max(version_id) in goose_db_version (goose's own current-version query; down deletes rows)
+  with the newest embedded migration; refuses to start if lower or higher.
+- Added spilling (internal/storage/spill.go): a failed final save writes entries to
+  %LOCALAPPDATA%\filemaster\unsaved\unsaved-<nanos>-<pid>.json (temp + rename). The next
+  watcher claims files by renaming them, drops entries past retention or whose session is gone
+  (those would poison every save), and merges the rest into its buffer; they go out with the
+  next regular save. Corrupt files are kept as .bad. A killed process still can't spill.
+- Owner applied 00002 on the real DB (2026-11-04).
+Decision: migrations stay a separate `filemaster migrate` step, not automatic at startup
+(the daemon runs as DML-only fm_app; auto-migrating would need owner credentials in the
+daemon and would run destructive migrations like 00002 without review).
+Known gap (asked owner): if a watcher's final save AND EndSession both fail, the next start
+closes that session as an orphan before the recovered entries are saved, so it gets
+kind "other" and a 0s duration. Fix would be saving recovered entries immediately at startup
+(an extra save → needs owner approval) or reclassifying after the recovered save.
+
+== 2026-11-05: automatic migrations (reverses the 2026-11-04 decision) ==
+Owner: a separate `migrate` step defeats the purpose of a hands-off watcher. Now:
+- storage.Connect: open the fm_app pool; if checkSchemaVersion reports the schema behind and
+  MIGRATE_DATABASE_URL is set, run MigrateUp as fm_owner, then reopen the app pool. Used by
+  watch, sessions, history, prune (main.go connect()).
+- MigrateUp uses goose's Provider with lock.NewPostgresSessionLocker (advisory lock), so
+  simultaneous starts apply each migration once; only goes up; each migration in its own tx.
+- The owner connection exists only while migrating. Verified: during `watch`,
+  pg_stat_activity shows only fm_app.
+- Unset MIGRATE_DATABASE_URL = previous behavior (refuse to start with a clear message).
+- New test TestConnectAppliesPendingMigrationsOnce (needs FILEMASTER_TEST_MIGRATE_DATABASE_URL):
+  two concurrent Connects after a down; exactly one applies.
+Role separation is kept for everything the database enforces (runtime DML-only, objects
+owned by fm_owner, default privileges, SECURITY DEFINER functions). What's weaker: the watcher
+host's .env now holds owner credentials the watcher process can read.
+Rule added to AGENTS.md: every migration must be safe to run unattended.
+Still manual: db/bootstrap.sql (needs the postgres superuser).
+
+== 2026-11-05: end reasons, rollback confirmation, test suite ==
+Owner's answers: tests on GitHub Actions, written with pytest; add end reason + reclassify;
+rollbacks require confirmation.
+- Smart App Control is ON (enforcing) on the owner's PC. CodeIntegrity log (event 3077) showed it
+  blocking covdata.exe and storage.test.exe today, main.exe on 2026-10-22 and 11-02. Intermittent.
+  Owner asked not to work around it: verify locally with `go vet` only; run tests in CI.
+- 00003_session_end_reason.sql: session_end enum (stopped/idle/recovered), sessions.end_reason,
+  view gains end_reason as last column (CREATE OR REPLACE). Additive, safe unattended.
+- Manager passes EndIdle / EndStopped; CloseOrphans passes EndRecovered.
+- Spilled entries load with recovered=true; the save that writes them runs reclassifyRecovered
+  in the same transaction: recompute kind from session_summary counts and move ended_at to the
+  last activity (GREATEST), for already-closed sessions only. Fixes the "other, 0s" mislabel
+  without an extra save.
+- `sessions` CLI: ENDED BY column; recovered durations shown as "~3m".
+- migrate down/down-to/redo/reset: storage.RollbackPlan lists migrations to undo and the DROP
+  lines from their Down sections; refuses without --yes.
+- Test suite: tests/pgtemp.py (clusters), tests/harness.py (isolated runs: temp cwd so .env is
+  never loaded, temp LOCALAPPDATA, scrubbed env), tests/e2e/ (18 tests: recording, sessions,
+  recovery, migrations, history/retention). CI builds filemaster with -cover and reports e2e
+  coverage via GOCOVERDIR + covdata.
+- Verified locally: Go vet; pgtemp create/bootstrap/query/restart/delete; path round-trip.
+  NOT yet run: Go tests and pytest suite (need CI because of Smart App Control).
+- rules.sql (owner's file, untracked): their original setup notes. Not edited. Unlike
+  db/bootstrap.sql it also revokes PUBLIC's database access.
+
+== 2026-11-05 (later): classification rules, file names in summaries ==
+Owner's session 2 (4 writes, 2 renames, 1 remove; real saving + tidying) came out "other" under
+the old 60% rule. Owner's decisions:
+- One session, both labels: kind "mixed", shown "work + organization" (not split into sessions).
+- A behavior is in the label at >= 20% of events (40 saves + 1 rename stays "work").
+- "other" split: "mixed" + "brief" (< 3 events). Migration 00004 adds both enum values
+  (additive; Down rebuilds the type and maps them to "other"). "other" no longer produced.
+- Summaries list files per op (relative to the watched root; renames "old -> new"), max 10
+  names per line + "+N more"; distinct files tracked as maphash uint64s. Same printer for the
+  live summary and the new `filemaster session <id>` (from session_summary + file_activity).
+- Owner said to delete existing sessions rather than relabel. Done 2026-11-05 on the real DB as
+  fm_app in one transaction (guarded: abort if a filemaster connection exists): deleted 2
+  sessions, 5 activity rows, 3 versions, 6 paths, 3 blobs. Schema left at version 3. No spill
+  files existed.
+Open question raised with owner: a newly created file that is then saved counts its CREATE as
+organization, so "create a doc + 4 saves" is exactly 20% organization -> mixed. Tests avoid it by
+creating files before the watcher starts.
+NOT yet run: Go tests and pytest suite (Smart App Control; CI not pushed yet). go vet passes.
+
+== 2026-11-05 (later): new files that get saved are work ==
+Owner: creating a file you then save is work, and so is renaming that created file.
+- internal/session/behavior.go: behaviorTracker keeps one entry per file created in the session
+  (8-byte hash -> pending count + written flag), moved along on renames. A WRITE turns the file's
+  pending create/renames into work; later renames of a written new file are work. Removed unsaved
+  new files (scratch files) and never-saved ones stay organization. Classify now takes Behavior
+  {Work, Organization}.
+- From saved data (CloseOrphans, reclassifyRecovered, `session <id>` on open sessions):
+  BehaviorFromFiles over per-file totals (new query SessionFileCounts) - a file with creates>0 and
+  writes>0 counts creates+renames as work. Per path only, so a new file renamed before its first
+  save counts as organization there; the live tracker gets that case right.
+NOT yet run: Go tests and pytest suite (Smart App Control); first CI run happens on push.

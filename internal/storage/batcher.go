@@ -36,6 +36,9 @@ type activity struct {
 	firstAt   time.Time
 	lastAt    time.Time
 	lastOp    string
+	// recovered marks activity loaded from a previous run's spill file.
+	// Its session may already be closed and classified without it.
+	recovered bool
 }
 
 type activityKey struct {
@@ -53,11 +56,12 @@ type saveResult struct {
 // pipeline the version updates. Saves run in their own goroutine so hashing
 // and database time never block event intake.
 type batcher struct {
-	pool    *pgxpool.Pool
-	q       *db.Queries
-	in      chan session.Event
-	results chan saveResult
-	done    chan struct{}
+	pool     *pgxpool.Pool
+	q        *db.Queries
+	spillDir string // where unsaved entries go on exit; "" disables
+	in       chan session.Event
+	results  chan saveResult
+	done     chan struct{}
 
 	// Owned by run.
 	pending    map[activityKey]*activity
@@ -69,10 +73,11 @@ type batcher struct {
 	partitions map[string]bool // UTC days ("2006-01-02") known to have a partition
 }
 
-func newBatcher(pool *pgxpool.Pool, q *db.Queries) *batcher {
+func newBatcher(pool *pgxpool.Pool, q *db.Queries, spillDir string) *batcher {
 	b := &batcher{
 		pool:       pool,
 		q:          q,
+		spillDir:   spillDir,
 		in:         make(chan session.Event, 256),
 		results:    make(chan saveResult),
 		done:       make(chan struct{}),
@@ -96,6 +101,7 @@ func (b *batcher) close() {
 
 func (b *batcher) run() {
 	defer close(b.done)
+	b.recoverSpilled()
 	ticker := time.NewTicker(saveInterval)
 	defer ticker.Stop()
 
@@ -160,13 +166,62 @@ func (b *batcher) shutdown() {
 		b.finishSave(<-b.results)
 	}
 	b.startSave()
-	if b.saving {
-		r := <-b.results
-		b.saving = false
-		if r.err != nil {
-			log.Printf("storage: %d file entries were not saved: %v", len(r.batch), r.err)
-		}
+	if !b.saving {
+		return
 	}
+	r := <-b.results
+	b.saving = false
+	if r.err == nil {
+		return
+	}
+	if path, err := spill(b.spillDir, r.batch); err != nil {
+		log.Printf("storage: %d file entries were not saved (%v) and could not be kept for the next run: %v",
+			len(r.batch), r.err, err)
+	} else {
+		log.Printf("storage: final save failed (%v); kept %d file entries in %s, the next watch will save them",
+			r.err, len(r.batch), path)
+	}
+}
+
+// recoverSpilled loads entries a previous watcher couldn't save into the
+// buffer; they go out with the next regular save. Entries past the
+// retention period, or whose session no longer exists, are dropped: they
+// would otherwise fail every save they're part of.
+func (b *batcher) recoverSpilled() {
+	entries := claimSpilled(b.spillDir)
+	if len(entries) == 0 {
+		return
+	}
+
+	cutoff := time.Now().Add(-retention)
+	ids := make([]int64, 0, len(entries))
+	for _, a := range entries {
+		ids = append(ids, a.sessionID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+	defer cancel()
+	existing, err := b.q.ExistingSessions(ctx, ids)
+	if err != nil {
+		// Can't tell; keep them all and let the save decide.
+		log.Printf("storage: checking sessions of recovered entries: %v", err)
+	}
+	known := make(map[int64]bool, len(existing))
+	for _, id := range existing {
+		known[id] = true
+	}
+
+	recovered, skipped := 0, 0
+	for _, a := range entries {
+		if a.lastAt.Before(cutoff) || (err == nil && !known[a.sessionID]) {
+			skipped++
+			continue
+		}
+		b.merge(a)
+		recovered++
+	}
+	b.trim()
+	log.Printf("storage: recovered %d unsaved file entries from a previous run (%d expired or orphaned, dropped); saving with the next save",
+		recovered, skipped)
 }
 
 // merge folds a into the pending entry for the same session and path.
@@ -181,6 +236,7 @@ func (b *batcher) merge(a *activity) {
 	cur.counts.Writes += a.counts.Writes
 	cur.counts.Renames += a.counts.Renames
 	cur.counts.Removes += a.counts.Removes
+	cur.recovered = cur.recovered || a.recovered
 	if a.firstAt.Before(cur.firstAt) {
 		cur.firstAt = a.firstAt
 	}
@@ -342,7 +398,49 @@ func (b *batcher) save(batch []*activity) error {
 		}
 	}
 
+	if err := reclassifyRecovered(ctx, q, batch); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// reclassifyRecovered updates the kind and end time of already-closed
+// sessions that just received recovered activity. A session closed by
+// orphan recovery before its spilled data arrived was classified from too
+// little (often nothing); now that its data is saved, classify it again
+// from the database's counts. Runs inside the save transaction, so the
+// counts include this batch.
+func reclassifyRecovered(ctx context.Context, q *db.Queries, batch []*activity) error {
+	seen := make(map[int64]bool)
+	var ids []int64
+	for _, a := range batch {
+		if a.recovered && !seen[a.sessionID] {
+			seen[a.sessionID] = true
+			ids = append(ids, a.sessionID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	rows, err := q.ClosedSessionCounts(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("read counts of recovered sessions: %w", err)
+	}
+	kinds, err := classifySaved(ctx, q, ids)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if err := q.ReclassifySession(ctx, db.ReclassifySessionParams{
+			ID:         r.SessionID,
+			Kind:       db.SessionKind(kinds[r.SessionID]),
+			LastSeenAt: r.LastSeenAt,
+		}); err != nil {
+			return fmt.Errorf("reclassify recovered session %d: %w", r.SessionID, err)
+		}
+	}
+	return nil
 }
 
 // ensurePartitions creates the daily file_activity partition for each day

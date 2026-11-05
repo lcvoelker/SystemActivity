@@ -4,6 +4,8 @@ sql:
     schema:
       - internal/db/migrations/00001_init.sql
       - internal/db/migrations/00002_activity_retention.sql
+      - internal/db/migrations/00003_session_end_reason.sql
+      - internal/db/migrations/00004_session_kinds.sql
     queries: internal/db/queries
     gen:
       go:

@@ -10,8 +10,7 @@ type Event struct {
 	OldPath   string // For rename operations
 }
 
-// Counts tallies events by operation. Sessions keep only counts in memory,
-// not paths, so a 4–7 hour session over a large tree stays small.
+// Counts tallies events by operation.
 type Counts struct {
 	Creates int
 	Writes  int
@@ -37,16 +36,16 @@ func (c Counts) Total() int {
 }
 
 type Session struct {
-	ID     int64
-	Start  time.Time
-	End    time.Time
-	Counts Counts
+	ID       int64
+	Start    time.Time
+	End      time.Time
+	Counts   Counts
+	Files    Files
+	behavior behaviorTracker
 }
 
-type Summary struct {
-	SessionID int64
-	Start     time.Time
-	End       time.Time
-	Counts    Counts
-	Kind      Kind
+// Behavior is how the session's events split between work and
+// organization so far.
+func (s *Session) Behavior() Behavior {
+	return s.behavior.behavior()
 }
