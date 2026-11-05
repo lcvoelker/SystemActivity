@@ -10,22 +10,102 @@ import (
 	"time"
 )
 
+const closedSessionCounts = `-- name: ClosedSessionCounts :many
+SELECT session_id,
+       coalesce(last_activity_at, started_at)::timestamptz AS last_seen_at,
+       creates, writes, renames, removes
+FROM session_summary
+WHERE session_id = ANY($1::bigint[])
+  AND ended_at IS NOT NULL
+`
+
+type ClosedSessionCountsRow struct {
+	SessionID  int64
+	LastSeenAt time.Time
+	Creates    int64
+	Writes     int64
+	Renames    int64
+	Removes    int64
+}
+
+// Saved counts of already-closed sessions, for reclassifying them after
+// activity recovered from a previous run arrives late.
+func (q *Queries) ClosedSessionCounts(ctx context.Context, ids []int64) ([]ClosedSessionCountsRow, error) {
+	rows, err := q.db.Query(ctx, closedSessionCounts, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClosedSessionCountsRow
+	for rows.Next() {
+		var i ClosedSessionCountsRow
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.LastSeenAt,
+			&i.Creates,
+			&i.Writes,
+			&i.Renames,
+			&i.Removes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const endSession = `-- name: EndSession :exec
 UPDATE sessions
 SET ended_at = $1::timestamptz,
-    kind = $2::session_kind
-WHERE id = $3
+    kind = $2::session_kind,
+    end_reason = $3::session_end
+WHERE id = $4
 `
 
 type EndSessionParams struct {
-	EndedAt time.Time
-	Kind    SessionKind
-	ID      int64
+	EndedAt   time.Time
+	Kind      SessionKind
+	EndReason SessionEnd
+	ID        int64
 }
 
 func (q *Queries) EndSession(ctx context.Context, arg EndSessionParams) error {
-	_, err := q.db.Exec(ctx, endSession, arg.EndedAt, arg.Kind, arg.ID)
+	_, err := q.db.Exec(ctx, endSession,
+		arg.EndedAt,
+		arg.Kind,
+		arg.EndReason,
+		arg.ID,
+	)
 	return err
+}
+
+const existingSessions = `-- name: ExistingSessions :many
+SELECT id
+FROM sessions
+WHERE id = ANY($1::bigint[])
+`
+
+func (q *Queries) ExistingSessions(ctx context.Context, ids []int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, existingSessions, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const openSessions = `-- name: OpenSessions :many
@@ -82,7 +162,7 @@ func (q *Queries) OpenSessions(ctx context.Context, arg OpenSessionsParams) ([]O
 }
 
 const recentSessions = `-- name: RecentSessions :many
-SELECT session_id, host, root_path, started_at, ended_at, kind, last_activity_at, total_events, unique_files, creates, writes, renames, removes
+SELECT session_id, host, root_path, started_at, ended_at, kind, last_activity_at, total_events, unique_files, creates, writes, renames, removes, end_reason
 FROM session_summary
 ORDER BY started_at DESC
 LIMIT $1
@@ -107,6 +187,148 @@ func (q *Queries) RecentSessions(ctx context.Context, limit int32) ([]SessionSum
 			&i.LastActivityAt,
 			&i.TotalEvents,
 			&i.UniqueFiles,
+			&i.Creates,
+			&i.Writes,
+			&i.Renames,
+			&i.Removes,
+			&i.EndReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const reclassifySession = `-- name: ReclassifySession :exec
+UPDATE sessions
+SET kind = $1::session_kind,
+    ended_at = GREATEST(ended_at, $2::timestamptz)
+WHERE id = $3
+`
+
+type ReclassifySessionParams struct {
+	Kind       SessionKind
+	LastSeenAt time.Time
+	ID         int64
+}
+
+func (q *Queries) ReclassifySession(ctx context.Context, arg ReclassifySessionParams) error {
+	_, err := q.db.Exec(ctx, reclassifySession, arg.Kind, arg.LastSeenAt, arg.ID)
+	return err
+}
+
+const sessionDetail = `-- name: SessionDetail :one
+SELECT session_id, host, root_path, started_at, ended_at, kind, last_activity_at, total_events, unique_files, creates, writes, renames, removes, end_reason
+FROM session_summary
+WHERE session_id = $1
+`
+
+func (q *Queries) SessionDetail(ctx context.Context, sessionID int64) (SessionSummary, error) {
+	row := q.db.QueryRow(ctx, sessionDetail, sessionID)
+	var i SessionSummary
+	err := row.Scan(
+		&i.SessionID,
+		&i.Host,
+		&i.RootPath,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Kind,
+		&i.LastActivityAt,
+		&i.TotalEvents,
+		&i.UniqueFiles,
+		&i.Creates,
+		&i.Writes,
+		&i.Renames,
+		&i.Removes,
+		&i.EndReason,
+	)
+	return i, err
+}
+
+const sessionFileCounts = `-- name: SessionFileCounts :many
+SELECT a.session_id,
+       a.file_id,
+       sum(a.creates)::bigint AS creates,
+       sum(a.writes)::bigint  AS writes,
+       sum(a.renames)::bigint AS renames,
+       sum(a.removes)::bigint AS removes
+FROM file_activity a
+WHERE a.session_id = ANY($1::bigint[])
+GROUP BY a.session_id, a.file_id
+`
+
+type SessionFileCountsRow struct {
+	SessionID int64
+	FileID    int64
+	Creates   int64
+	Writes    int64
+	Renames   int64
+	Removes   int64
+}
+
+// Per-file totals for classifying sessions from saved data: a file both
+// created and saved in a session counts as work (session.BehaviorFromFiles).
+func (q *Queries) SessionFileCounts(ctx context.Context, ids []int64) ([]SessionFileCountsRow, error) {
+	rows, err := q.db.Query(ctx, sessionFileCounts, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SessionFileCountsRow
+	for rows.Next() {
+		var i SessionFileCountsRow
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.FileID,
+			&i.Creates,
+			&i.Writes,
+			&i.Renames,
+			&i.Removes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sessionFiles = `-- name: SessionFiles :many
+SELECT f.path, a.old_path, a.creates, a.writes, a.renames, a.removes
+FROM file_activity a
+JOIN files f ON f.id = a.file_id
+WHERE a.session_id = $1
+ORDER BY a.first_at, f.path
+`
+
+type SessionFilesRow struct {
+	Path    string
+	OldPath *string
+	Creates int32
+	Writes  int32
+	Renames int32
+	Removes int32
+}
+
+// Every file a session touched, in the order it was first touched.
+func (q *Queries) SessionFiles(ctx context.Context, sessionID int64) ([]SessionFilesRow, error) {
+	rows, err := q.db.Query(ctx, sessionFiles, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SessionFilesRow
+	for rows.Next() {
+		var i SessionFilesRow
+		if err := rows.Scan(
+			&i.Path,
+			&i.OldPath,
 			&i.Creates,
 			&i.Writes,
 			&i.Renames,

@@ -30,7 +30,13 @@ type Store struct {
 	batcher *batcher
 }
 
+// NewStore starts a store whose unsaved activity is kept in the user's
+// cache directory on exit and recovered on the next start.
 func NewStore(pool *pgxpool.Pool, root string) *Store {
+	return newStore(pool, root, defaultSpillDir())
+}
+
+func newStore(pool *pgxpool.Pool, root, spillDir string) *Store {
 	host, err := os.Hostname()
 	if err != nil {
 		host = "unknown"
@@ -40,7 +46,7 @@ func NewStore(pool *pgxpool.Pool, root string) *Store {
 		q:       q,
 		host:    host,
 		root:    root,
-		batcher: newBatcher(pool, q),
+		batcher: newBatcher(pool, q, spillDir),
 	}
 }
 
@@ -52,8 +58,13 @@ func (s *Store) StartSession(ctx context.Context, start time.Time) (int64, error
 	})
 }
 
-func (s *Store) EndSession(ctx context.Context, id int64, end time.Time, kind session.Kind) error {
-	return s.q.EndSession(ctx, db.EndSessionParams{ID: id, EndedAt: end, Kind: db.SessionKind(kind)})
+func (s *Store) EndSession(ctx context.Context, id int64, end time.Time, kind session.Kind, reason session.EndReason) error {
+	return s.q.EndSession(ctx, db.EndSessionParams{
+		ID:        id,
+		EndedAt:   end,
+		Kind:      db.SessionKind(kind),
+		EndReason: db.SessionEnd(reason),
+	})
 }
 
 func (s *Store) Record(e session.Event) {
@@ -71,17 +82,19 @@ func (s *Store) Close() {
 // was still buffered in the killed process is lost.
 func (s *Store) CloseOrphans(ctx context.Context) (int, error) {
 	open, err := s.q.OpenSessions(ctx, db.OpenSessionsParams{Host: s.host, RootPath: s.root})
+	if err != nil || len(open) == 0 {
+		return 0, err
+	}
+	ids := make([]int64, len(open))
+	for i, o := range open {
+		ids[i] = o.SessionID
+	}
+	kinds, err := classifySaved(ctx, s.q, ids)
 	if err != nil {
 		return 0, err
 	}
 	for _, o := range open {
-		kind := session.Classify(session.Counts{
-			Creates: int(o.Creates),
-			Writes:  int(o.Writes),
-			Renames: int(o.Renames),
-			Removes: int(o.Removes),
-		})
-		if err := s.EndSession(ctx, o.SessionID, o.LastSeenAt, kind); err != nil {
+		if err := s.EndSession(ctx, o.SessionID, o.LastSeenAt, kinds[o.SessionID], session.EndRecovered); err != nil {
 			return 0, fmt.Errorf("close orphaned session %d: %w", o.SessionID, err)
 		}
 	}

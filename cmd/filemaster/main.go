@@ -11,10 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"github.com/lcvoelker/SystemActivity/internal/db"
@@ -24,11 +28,17 @@ import (
 )
 
 const usage = `usage:
-  filemaster migrate [up|down|status|version|redo|reset]   as fm_owner (MIGRATE_DATABASE_URL)
+  filemaster migrate [up|status|version]                   as fm_owner (MIGRATE_DATABASE_URL)
+  filemaster migrate [down|down-to N|redo|reset] --yes    roll back; lists what it drops first
   filemaster watch [-offline] [-idle 5m] <directory>       as fm_app   (DATABASE_URL)
   filemaster sessions [-n 10]                              recent sessions and their kind
+  filemaster session <id>                                  one session's summary, with file names
   filemaster history <file>                                content versions of a file
-  filemaster prune                                         delete data past the 3-day retention now`
+  filemaster prune                                         delete data past the 3-day retention now
+
+watch, sessions, history and prune apply pending migrations first when
+MIGRATE_DATABASE_URL is set; leave it unset to keep owner credentials
+out of the watcher.`
 
 func main() {
 	// .env is optional; variables already set in the environment win.
@@ -50,6 +60,8 @@ func main() {
 		err = runWatch(ctx, os.Args[2:])
 	case "sessions":
 		err = runSessions(ctx, os.Args[2:])
+	case "session":
+		err = runSession(ctx, os.Args[2:])
 	case "history":
 		err = runHistory(ctx, os.Args[2:])
 	case "prune":
@@ -72,7 +84,49 @@ func runMigrate(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		command, args = args[0], args[1:]
 	}
+
+	switch command {
+	case "down", "down-to", "redo", "reset":
+		var confirmed bool
+		args, confirmed = takeFlag(args, "--yes", "-yes")
+		plan, err := storage.RollbackPlan(ctx, dsn, command, args)
+		if err != nil {
+			return err
+		}
+		if len(plan) == 0 {
+			fmt.Println("No applied migrations to undo.")
+			return nil
+		}
+		fmt.Printf("migrate %s will undo:\n", command)
+		for _, u := range plan {
+			fmt.Printf("  %05d %s\n", u.Version, u.File)
+			for _, d := range u.Drops {
+				fmt.Printf("      %s\n", d)
+			}
+		}
+		if command == "redo" {
+			fmt.Println("and then apply it again; data in what it drops is not restored.")
+		}
+		if !confirmed {
+			return fmt.Errorf("rolling back deletes the data listed above; re-run with --yes to proceed")
+		}
+	}
 	return storage.Migrate(ctx, dsn, command, args...)
+}
+
+// takeFlag removes every occurrence of the given flag spellings from args
+// and reports whether any was present.
+func takeFlag(args []string, names ...string) ([]string, bool) {
+	var rest []string
+	found := false
+	for _, a := range args {
+		if slices.Contains(names, a) {
+			found = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return rest, found
 }
 
 func runWatch(ctx context.Context, args []string) error {
@@ -90,11 +144,7 @@ func runWatch(ctx context.Context, args []string) error {
 
 	var store session.Store = &session.OfflineStore{}
 	if !*offline {
-		dsn, err := requireEnv("DATABASE_URL")
-		if err != nil {
-			return err
-		}
-		pool, err := storage.NewPool(ctx, dsn)
+		pool, err := connect(ctx)
 		if err != nil {
 			return fmt.Errorf("connect to Postgres (use -offline to run without it): %w", err)
 		}
@@ -122,7 +172,7 @@ func runWatch(ctx context.Context, args []string) error {
 		return err
 	}
 
-	manager := session.NewManager(*idle, store)
+	manager := session.NewManager(root, *idle, store)
 	events := make(chan session.Event, 100)
 	end := make(chan struct{})
 
@@ -178,20 +228,109 @@ func runSessions(ctx context.Context, args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tKIND\tSTARTED\tDURATION\tEVENTS\tFILES\tCREATE\tWRITE\tRENAME\tREMOVE\tROOT")
+	fmt.Fprintln(tw, "ID\tKIND\tENDED BY\tSTARTED\tDURATION\tEVENTS\tFILES\tCREATE\tWRITE\tRENAME\tREMOVE\tROOT")
 	for _, s := range sessions {
-		duration, kind := "active", "-"
+		duration, kind, endedBy := "active", "-", "-"
 		if s.EndedAt != nil {
 			duration = s.EndedAt.Sub(s.StartedAt).Round(time.Second).String()
 		}
 		if s.Kind.Valid {
-			kind = string(s.Kind.SessionKind)
+			kind = session.Kind(s.Kind.SessionKind).Label()
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
-			s.SessionID, kind, s.StartedAt.Local().Format(time.DateTime), duration,
+		if s.EndReason.Valid {
+			endedBy = string(s.EndReason.SessionEnd)
+			if s.EndReason.SessionEnd == db.SessionEndRecovered {
+				duration = "~" + duration // end time is the last saved activity
+			}
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
+			s.SessionID, kind, endedBy, s.StartedAt.Local().Format(time.DateTime), duration,
 			s.TotalEvents, s.UniqueFiles, s.Creates, s.Writes, s.Renames, s.Removes, s.RootPath)
 	}
 	return tw.Flush()
+}
+
+// runSession prints a stored session's summary, with file names, in the
+// same format as the summary printed when a watch ends.
+func runSession(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: filemaster session <id>")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("session id %q is not a number", args[0])
+	}
+
+	q, closeDB, err := openQueries(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+
+	s, err := q.SessionDetail(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("no session %d (sessions older than 3 days are deleted)", id)
+	}
+	if err != nil {
+		return err
+	}
+	files, err := q.SessionFiles(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	summary := session.Summary{
+		SessionID: s.SessionID,
+		Start:     s.StartedAt,
+		End:       s.StartedAt,
+		Counts: session.Counts{
+			Creates: int(s.Creates),
+			Writes:  int(s.Writes),
+			Renames: int(s.Renames),
+			Removes: int(s.Removes),
+		},
+	}
+	switch {
+	case s.EndedAt != nil:
+		summary.End = *s.EndedAt
+	case s.LastActivityAt != nil:
+		summary.End = *s.LastActivityAt
+	}
+	if s.EndReason.Valid {
+		summary.EndReason = session.EndReason(s.EndReason.SessionEnd)
+	}
+	perFile := make(map[string]session.Counts) // a file's totals across save windows
+	for _, f := range files {
+		oldPath := ""
+		if f.OldPath != nil {
+			oldPath = *f.OldPath
+		}
+		c := session.Counts{
+			Creates: int(f.Creates),
+			Writes:  int(f.Writes),
+			Renames: int(f.Renames),
+			Removes: int(f.Removes),
+		}
+		summary.Files.AddSaved(s.RootPath, f.Path, oldPath, c)
+		t := perFile[f.Path]
+		t.Creates, t.Writes = t.Creates+c.Creates, t.Writes+c.Writes
+		t.Renames, t.Removes = t.Renames+c.Renames, t.Removes+c.Removes
+		perFile[f.Path] = t
+	}
+	if s.Kind.Valid {
+		summary.Kind = session.Kind(s.Kind.SessionKind)
+	} else { // still open: classify what has been saved so far
+		totals := make([]session.Counts, 0, len(perFile))
+		for _, c := range perFile {
+			totals = append(totals, c)
+		}
+		summary.Kind = session.Classify(session.BehaviorFromFiles(totals))
+	}
+	summary.Print(os.Stdout)
+	if s.EndedAt == nil {
+		fmt.Println("(still open: activity in a running watcher's buffer isn't saved yet)")
+	}
+	return nil
 }
 
 func runHistory(ctx context.Context, args []string) error {
@@ -267,15 +406,27 @@ func runPrune(ctx context.Context) error {
 }
 
 func openQueries(ctx context.Context) (*db.Queries, func(), error) {
-	dsn, err := requireEnv("DATABASE_URL")
-	if err != nil {
-		return nil, nil, err
-	}
-	pool, err := storage.NewPool(ctx, dsn)
+	pool, err := connect(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	return db.New(pool), pool.Close, nil
+}
+
+// connect opens the app-role pool, first applying any pending migrations
+// as the schema owner when MIGRATE_DATABASE_URL is set. Leave it unset to
+// keep owner credentials away from the watcher; upgrades then need
+// `filemaster migrate up`.
+func connect(ctx context.Context) (*pgxpool.Pool, error) {
+	dsn, err := requireEnv("DATABASE_URL")
+	if err != nil {
+		return nil, err
+	}
+	pool, applied, err := storage.Connect(ctx, dsn, os.Getenv("MIGRATE_DATABASE_URL"))
+	for _, v := range applied {
+		fmt.Printf("Applied database migration %05d.\n", v)
+	}
+	return pool, err
 }
 
 func requireEnv(name string) (string, error) {

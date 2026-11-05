@@ -2,8 +2,9 @@
 
 A Go daemon that watches a large folder tree during a work session, records
 only the files that change while it runs, and classifies each session as
-**work** (frequent saves), **organization** (creating, renaming, moving and
-deleting files and folders) or **other**. Activity goes to PostgreSQL with
+**work** (saves), **organization** (creating, renaming, moving and deleting
+files and folders), **work + organization**, or **brief**, with summaries
+that list the files behind each operation. Activity goes to PostgreSQL with
 content-addressed version history, so you can ask when a file's *content*
 actually changed and which other paths hold identical content. Data is kept
 for 3 days.
@@ -27,17 +28,16 @@ for 3 days.
 
 2. Copy `.env.example` to `.env` and fill in the `fm_app` / `fm_owner` passwords.
 
-3. Apply migrations as the schema owner:
-
-   ```
-   go run ./cmd/filemaster migrate up
-   ```
+3. Start the watcher. With `MIGRATE_DATABASE_URL` set, it creates or
+   upgrades the tables itself; `go run ./cmd/filemaster migrate up` does the
+   same by hand.
 
 ## Usage
 
 ```
 go run ./cmd/filemaster watch D:\Downloads\look   # type "end" or Ctrl+C to stop
 go run ./cmd/filemaster sessions -n 10            # recent sessions: kind and per-op counts
+go run ./cmd/filemaster session 12                # one session's summary, with file names
 go run ./cmd/filemaster history D:\Downloads\look\notes.txt
 go run ./cmd/filemaster prune                     # apply the 3-day retention now
 go run ./cmd/filemaster migrate status
@@ -69,13 +69,35 @@ Design choices worth knowing:
   needs DDL rights. `migrate` refuses to run as anyone but the schema owner.
 - **Bounded memory**: events are merged per file in memory (a file saved
   40 times is one entry with a write count) and hashed once at save time.
-  At most 1,000 entries are held; reaching that saves early. Sessions keep
+  At most 1,000 entries are held; reaching that will save early. Sessions keep
   only counters. Folder watches use 16 KB buffers instead of 64 KB.
 - **Batched writes**: every 5 minutes, one transaction does path and blob
   upserts using arrays, the activity rows via `COPY`, then version changes as
   one pipelined batch. If the database is down, data waits for the next save.
 - **Retention**: data older than 3 days is removed at startup and hourly,
   mostly by dropping whole daily partitions.
+- **Automatic, least-privilege migrations**: on startup the watcher checks
+  the schema version. If it's behind, it applies the pending migrations as
+  the owner role under a Postgres advisory lock, closes that connection, and
+  then runs as the DML-only app role. Without `MIGRATE_DATABASE_URL` it
+  refuses to start with a clear message instead of failing mid-session.
+- **No data lost on a failed exit**: if the final save fails, unsaved entries
+  are written to `%LOCALAPPDATA%\filemaster\unsaved\` and recovered by the
+  next `watch`.
+
+## Testing
+
+Three layers run on GitHub Actions (Actions tab > **tests** > **Run workflow**,
+or automatically on push) on a Windows machine with throwaway Postgres
+clusters: Go unit tests, Go integration tests against real SQL, and a pytest
+end-to-end suite (`tests/e2e/`) that drives the real `filemaster` binary,
+creating, saving, renaming and deleting files and checking what reached the
+database. The job summary reports coverage for both the Go tests and the
+end-to-end runs.
+
+Locally, `python -m pip install -r tests/requirements.txt` then
+`python -m pytest tests`. On machines with Smart App Control, Windows may
+block the freshly built binary; the suite then stops and says so.
 
 ## Development
 

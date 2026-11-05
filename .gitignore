@@ -1,3 +1,5 @@
 .env
 .vs/
 *.exe
+__pycache__/
+.pytest_cache/

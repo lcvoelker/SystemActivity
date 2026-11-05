@@ -33,10 +33,11 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// recordAndSave records events through a fresh Store and closes it, which
+// recordAndSave records events through a fresh Store (spilling disabled, so
+// tests never touch the real spill directory) and closes it, which
 // saves them immediately instead of waiting for the 5-minute save.
 func recordAndSave(pool *pgxpool.Pool, root string, events ...session.Event) {
-	s := NewStore(pool, root)
+	s := newStore(pool, root, "")
 	for _, e := range events {
 		s.Record(e)
 	}
@@ -50,7 +51,7 @@ func TestStoreMergesActivityAndTracksVersions(t *testing.T) {
 	t.Cleanup(func() { cleanup(t, pool, root) })
 	a, b := filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")
 
-	id, err := NewStore(pool, root).StartSession(ctx, time.Now())
+	id, err := newStore(pool, root, "").StartSession(ctx, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestStoreMergesActivityAndTracksVersions(t *testing.T) {
 		t.Errorf("paths currently holding B = %v, want [%s]", dupes, b)
 	}
 
-	if err := NewStore(pool, root).EndSession(ctx, id, at(5), session.KindWork); err != nil {
+	if err := newStore(pool, root, "").EndSession(ctx, id, at(5), session.KindWork, session.EndStopped); err != nil {
 		t.Fatal(err)
 	}
 	var total int64
@@ -131,7 +132,7 @@ func TestCloseOrphans(t *testing.T) {
 
 	// A watcher that saved some reorganizing, then was killed before EndSession.
 	t0 := time.Now().UTC().Truncate(time.Millisecond)
-	id, err := NewStore(pool, root).StartSession(ctx, t0)
+	id, err := newStore(pool, root, "").StartSession(ctx, t0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +145,7 @@ func TestCloseOrphans(t *testing.T) {
 	}
 	recordAndSave(pool, root, events...)
 
-	n, err := NewStore(pool, root).CloseOrphans(ctx)
+	n, err := newStore(pool, root, "").CloseOrphans(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,12 +153,13 @@ func TestCloseOrphans(t *testing.T) {
 		t.Fatalf("closed %d orphaned sessions, want 1", n)
 	}
 	var endedAt time.Time
-	var kind string
-	if err := pool.QueryRow(ctx, `SELECT ended_at, kind FROM sessions WHERE id = $1`, id).Scan(&endedAt, &kind); err != nil {
+	var kind, reason string
+	if err := pool.QueryRow(ctx, `SELECT ended_at, kind, end_reason FROM sessions WHERE id = $1`, id).
+		Scan(&endedAt, &kind, &reason); err != nil {
 		t.Fatal(err)
 	}
-	if want := t0.Add(2 * time.Second); !endedAt.Equal(want) || kind != "organization" {
-		t.Errorf("orphan closed at %v as %q, want %v as organization", endedAt, kind, want)
+	if want := t0.Add(2 * time.Second); !endedAt.Equal(want) || kind != "organization" || reason != "recovered" {
+		t.Errorf("orphan closed at %v as %q (%s), want %v as organization (recovered)", endedAt, kind, reason, want)
 	}
 }
 
@@ -170,13 +172,13 @@ func TestPruneExpired(t *testing.T) {
 	write(t, path, "old content")
 
 	old := time.Now().Add(-retention - 48*time.Hour)
-	store := NewStore(pool, root)
+	store := newStore(pool, root, "")
 	id, err := store.StartSession(ctx, old)
 	if err != nil {
 		t.Fatal(err)
 	}
 	recordAndSave(pool, root, session.Event{SessionID: id, Path: path, Op: "CREATE", Timestamp: old})
-	if err := store.EndSession(ctx, id, old, session.KindOther); err != nil {
+	if err := store.EndSession(ctx, id, old, session.KindBrief, session.EndStopped); err != nil {
 		t.Fatal(err)
 	}
 
