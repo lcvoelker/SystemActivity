@@ -10,6 +10,9 @@ from harness import Filemaster
 
 
 def applied_versions(fm: Filemaster) -> list[int]:
+    # A database nothing has migrated yet has no version table at all.
+    if fm.pg.scalar("SELECT to_regclass('goose_db_version') IS NULL") == "t":
+        return []
     out = fm.pg.query("SELECT version_id FROM goose_db_version WHERE version_id > 0 ORDER BY 1")
     return [int(r[0]) for r in out]
 
