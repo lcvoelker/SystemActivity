@@ -102,10 +102,13 @@ def test_saving_and_tidying_is_work_plus_organization(fm, pg, watched):
 
 
 def test_a_few_events_are_brief(fm, pg, watched):
+    # A new folder is exactly one event (writes on folders are ignored).
+    # A new file would not do: Windows reports a CREATE plus one or two
+    # WRITEs, and a new file that gets saved counts as work.
     with fm.watch(watched) as w:
-        f = watched / "one.txt"
-        f.write_text("x")
-        w.expect_event("CREATE", f)
+        folder = watched / "new folder"
+        folder.mkdir()
+        w.expect_event("CREATE", folder)
         w.end()
 
     [s] = session_rows(pg, w.root)

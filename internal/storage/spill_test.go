@@ -106,7 +106,7 @@ func TestUnsavedEntriesSurviveFailedFinalSave(t *testing.T) {
 
 // The database is down when the user types end, so both the final save and
 // closing the session fail. The next start closes the session as an orphan
-// with nothing saved ("other", 0s); once its spilled activity is saved, the
+// with nothing saved ("brief", 0s); once its spilled activity is saved, the
 // session must be reclassified from the real counts and its end time moved
 // to the last activity.
 func TestRecoveredSessionIsReclassified(t *testing.T) {
@@ -136,11 +136,12 @@ func TestRecoveredSessionIsReclassified(t *testing.T) {
 	deadPool.Close()
 	first.Close()
 
-	// Next start: orphan recovery runs before the spilled data is saved.
+	// Next start: orphan recovery runs before the spilled data is saved, so
+	// it sees no events and labels the session brief.
 	if _, err := newStore(pool, root, "").CloseOrphans(ctx); err != nil {
 		t.Fatal(err)
 	}
-	assertSession(t, pool, id, "other", "recovered", start)
+	assertSession(t, pool, id, "brief", "recovered", start)
 
 	// The recovered activity is saved: kind and end time are corrected.
 	newStore(pool, root, spillDir).Close()
